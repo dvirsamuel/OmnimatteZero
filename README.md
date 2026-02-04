@@ -114,7 +114,58 @@ If you only have the object_mask, you can automatically generate total_mask usin
 python self_attention_map.py --video_folder ./example_videos/your_video_name
 ```
 
-This uses the diffusion model's self-attention to find regions that are related to the object (like shadows and reflections).
+This uses the diffusion model's self-attention to find regions that are semantically related to the object (like shadows and reflections).
+
+#### How It Works
+
+The self-attention mask generation leverages the internal attention patterns of the video diffusion model:
+
+1. **Video Encoding**: The input video is encoded to latent space using the VAE
+2. **Noise Injection**: A controlled amount of noise is added to the latents (flow matching at t=0.5)
+3. **Attention Extraction**: A forward pass through the transformer extracts self-attention maps from all 48 layers
+4. **Spatial-Temporal Attention**: For each frame, computes how much each spatial position attends to object regions across all frames
+5. **Mask Generation**: Attention values are upsampled, thresholded, and combined with the object mask
+
+The key insight is that regions affected by the object (shadows, reflections) will have high attention weights to the object itself.
+
+#### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--video_folder` | (required) | Folder containing `video.mp4` and `object_mask.mp4` |
+| `--height` | 512 | Processing height |
+| `--width` | 768 | Processing width |
+| `--threshold` | adaptive | Attention threshold (None = mean + 0.5*std) |
+| `--dilation` | 3 | Morphological dilation kernel size for smoothing |
+
+#### Example
+
+```bash
+# Recommended settings (works well for most videos)
+python self_attention_map.py --video_folder example_videos/cat_reflection --height 512 --width 768 --threshold 0.07 --dilation 3
+
+# Basic usage with adaptive threshold
+python self_attention_map.py --video_folder ./example_videos/cat_reflection
+
+# With custom threshold for more/less effect coverage
+python self_attention_map.py --video_folder ./example_videos/cat_reflection --threshold 0.08
+
+# Higher resolution processing
+python self_attention_map.py --video_folder ./example_videos/cat_reflection --height 720 --width 1280
+```
+
+#### Output
+
+The script generates `total_mask.mp4` in the same folder as the input, which includes:
+- The original object mask
+- Detected effects regions (shadows, reflections, etc.)
+
+Typical mask expansion ratios are 1.5x-2.0x depending on the scene's effects.
+
+#### 💡 Refine with SAM2
+
+For even better results, you can use the attention-based mask as a prompt for [SAM2](https://github.com/facebookresearch/segment-anything-2):
+This two-stage approach combines the semantic understanding of the diffusion model's attention (which knows *what* regions are related to the object) with SAM2's precise boundary detection (which knows *exactly where* those regions are).
 
 
 ### Important Note on Attention Guidance

@@ -1,5 +1,10 @@
-# Self-attention map extraction using one noising-denoising step with hooks
-# Generates total_mask.mp4 from video + object_mask by finding attention-based effects
+"""
+Self-attention map extraction for OmnimatteZero.
+Generates total_mask.mp4 from video + object_mask by finding attention-based effects (shadows, reflections).
+
+Usage:
+    python self_attention_map.py --video_folder ./example_videos/your_video_name
+"""
 
 from typing import Optional, List, Dict, Tuple
 import torch
@@ -13,141 +18,166 @@ import numpy as np
 import os
 
 
+def fix_num_frames_for_vae(num_frames: int, temporal_compression_ratio: int = 8) -> int:
+    """
+    Make sure num_frames is compatible with VAE: (k * ratio + 1).
+
+    Args:
+        num_frames: Original number of frames
+        temporal_compression_ratio: VAE temporal compression ratio (default: 8)
+
+    Returns:
+        Valid frame count for VAE
+    """
+    k = (num_frames - 1) // temporal_compression_ratio
+    valid_frames = k * temporal_compression_ratio + 1
+    if valid_frames < 1:
+        valid_frames = temporal_compression_ratio + 1
+    return valid_frames
+
+
 class AttentionMapExtractor:
-    def __init__(self, model, layer_indices=None, attention_type="self",
-                 store_queries_keys=False, average_over_heads=True):
+    """
+    Extracts attention maps from transformer attention layers using forward hooks.
+
+    Args:
+        model: The transformer model to extract attention from
+        layer_indices: Optional list of layer indices to extract (None = all layers)
+        attention_type: Type of attention to extract ("self" for attn1, "cross" for attn2)
+        average_over_heads: Whether to average attention weights over heads
+    """
+
+    def __init__(self, model: nn.Module, layer_indices: Optional[List[int]] = None,
+                 attention_type: str = "self", average_over_heads: bool = True):
         self.model = model
         self.layer_indices = layer_indices
         self.attention_type = attention_type
-        self.store_queries_keys = store_queries_keys
         self.average_over_heads = average_over_heads
 
         self._hooks = []
         self._attention_maps = {}
-        self._queries = {}
-        self._keys = {}
-        self._values = {}
         self._is_extracting = False
 
-    def _find_attention_modules(self):
+    def _find_attention_modules(self) -> List[Tuple[str, nn.Module, int]]:
+        """Find attention modules in the transformer model."""
         attention_modules = []
         layer_idx = 0
 
         for name, module in self.model.named_modules():
-            is_attention = any([
-                'attn' in name.lower(),
-                'attention' in name.lower(),
-                isinstance(module, nn.MultiheadAttention),
-            ])
+            name_parts = name.split('.')
+            if len(name_parts) < 2:
+                continue
 
-            is_self_attn = 'self' in name.lower() or 'attn1' in name.lower()
-            is_cross_attn = 'cross' in name.lower() or 'attn2' in name.lower()
+            last_part = name_parts[-1]
+            is_attn1 = last_part == 'attn1'
+            is_attn2 = last_part == 'attn2'
 
-            if is_attention:
-                if self.attention_type == "self" and not is_self_attn and is_cross_attn:
-                    continue
-                if self.attention_type == "cross" and not is_cross_attn and is_self_attn:
-                    continue
+            if not (is_attn1 or is_attn2):
+                continue
 
-                if self.layer_indices is not None and layer_idx not in self.layer_indices:
-                    layer_idx += 1
-                    continue
+            if self.attention_type == "self" and not is_attn1:
+                continue
+            if self.attention_type == "cross" and not is_attn2:
+                continue
 
-                attention_modules.append((name, module, layer_idx))
+            if self.layer_indices is not None and layer_idx not in self.layer_indices:
                 layer_idx += 1
+                continue
+
+            attention_modules.append((name, module, layer_idx))
+            layer_idx += 1
 
         return attention_modules
 
-    def _create_hook(self, layer_idx, module_name):
-        def hook(module, inputs, output):
+    def _create_hook(self, layer_idx: int, module_name: str):
+        """Create pre and post hooks for attention extraction."""
+        stored_inputs = {}
+
+        def pre_hook(module, args, kwargs):
+            if not self._is_extracting:
+                return
+            if len(args) > 0:
+                stored_inputs['hidden_states'] = args[0]
+            elif 'hidden_states' in kwargs:
+                stored_inputs['hidden_states'] = kwargs['hidden_states']
+
+            if len(args) > 1:
+                stored_inputs['encoder_hidden_states'] = args[1]
+            elif 'encoder_hidden_states' in kwargs:
+                stored_inputs['encoder_hidden_states'] = kwargs.get('encoder_hidden_states')
+
+        def post_hook(module, args, kwargs, output):
             if not self._is_extracting:
                 return
 
-            attention_weights = None
+            try:
+                hidden_states = stored_inputs.get('hidden_states')
+                if hidden_states is None:
+                    return
 
-            if isinstance(output, tuple) and len(output) >= 2:
-                if isinstance(output[1], torch.Tensor):
-                    attention_weights = output[1]
+                encoder_hidden_states = stored_inputs.get('encoder_hidden_states')
 
-            if attention_weights is None and hasattr(output, 'attention_probs'):
-                attention_weights = output.attention_probs
+                if encoder_hidden_states is None:
+                    query = module.to_q(hidden_states)
+                    key = module.to_k(hidden_states)
+                else:
+                    query = module.to_q(hidden_states)
+                    key = module.to_k(encoder_hidden_states)
 
-            if attention_weights is None and hasattr(module, '_attention_weights'):
-                attention_weights = module._attention_weights
+                if hasattr(module, 'norm_q') and module.norm_q is not None:
+                    query = module.norm_q(query)
+                if hasattr(module, 'norm_k') and module.norm_k is not None:
+                    key = module.norm_k(key)
 
-            if attention_weights is None:
-                attention_weights = self._compute_attention_from_qk(module, inputs)
+                batch_size, seq_len, _ = query.shape
+                head_dim = query.shape[-1] // module.heads
 
-            if attention_weights is not None:
-                if self.average_over_heads and attention_weights.dim() == 4:
+                query = query.view(batch_size, seq_len, module.heads, head_dim).transpose(1, 2)
+                key = key.view(batch_size, -1, module.heads, head_dim).transpose(1, 2)
+
+                scale = head_dim ** -0.5
+                attention_weights = torch.matmul(query, key.transpose(-2, -1)) * scale
+                attention_weights = F.softmax(attention_weights, dim=-1)
+
+                if self.average_over_heads:
                     attention_weights = attention_weights.mean(dim=1)
 
                 self._attention_maps[layer_idx] = attention_weights.detach().cpu()
 
-                if self.store_queries_keys:
-                    self._extract_qkv(module, inputs, layer_idx)
+            except Exception as e:
+                pass  # Silently skip layers with errors
+            finally:
+                stored_inputs.clear()
 
-        return hook
+        return pre_hook, post_hook
 
-    def _compute_attention_from_qk(self, module, inputs):
-        try:
-            if hasattr(module, 'to_q') and hasattr(module, 'to_k'):
-                hidden_states = inputs[0] if isinstance(inputs, tuple) else inputs
-
-                q = module.to_q(hidden_states)
-                k = module.to_k(hidden_states)
-
-                if hasattr(module, 'heads'):
-                    batch_size, seq_len, _ = q.shape
-                    head_dim = q.shape[-1] // module.heads
-                    q = q.view(batch_size, seq_len, module.heads, head_dim).transpose(1, 2)
-                    k = k.view(batch_size, seq_len, module.heads, head_dim).transpose(1, 2)
-
-                scale = q.shape[-1] ** -0.5
-                attention_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-                attention_weights = F.softmax(attention_weights, dim=-1)
-
-                return attention_weights
-        except:
-            pass
-        return None
-
-    def _extract_qkv(self, module, inputs, layer_idx):
-        try:
-            hidden_states = inputs[0] if isinstance(inputs, tuple) else inputs
-            if hasattr(module, 'to_q'):
-                self._queries[layer_idx] = module.to_q(hidden_states).detach().cpu()
-            if hasattr(module, 'to_k'):
-                self._keys[layer_idx] = module.to_k(hidden_states).detach().cpu()
-            if hasattr(module, 'to_v'):
-                self._values[layer_idx] = module.to_v(hidden_states).detach().cpu()
-        except:
-            pass
-
-    def register_hooks(self):
+    def register_hooks(self) -> int:
+        """Register hooks on attention modules. Returns number of modules hooked."""
         self.remove_hooks()
         attention_modules = self._find_attention_modules()
 
         for name, module, layer_idx in attention_modules:
-            hook = self._create_hook(layer_idx, name)
-            handle = module.register_forward_hook(hook)
-            self._hooks.append(handle)
+            pre_hook, post_hook = self._create_hook(layer_idx, name)
+            pre_handle = module.register_forward_pre_hook(pre_hook, with_kwargs=True)
+            post_handle = module.register_forward_hook(post_hook, with_kwargs=True)
+            self._hooks.append(pre_handle)
+            self._hooks.append(post_handle)
 
-        return len(self._hooks)
+        return len(self._hooks) // 2
 
     def remove_hooks(self):
+        """Remove all registered hooks."""
         for hook in self._hooks:
             hook.remove()
         self._hooks = []
 
     def clear_maps(self):
+        """Clear stored attention maps."""
         self._attention_maps = {}
-        self._queries = {}
-        self._keys = {}
-        self._values = {}
 
     @contextmanager
     def extraction_context(self):
+        """Context manager for attention extraction."""
         self._is_extracting = True
         self.clear_maps()
         try:
@@ -155,34 +185,63 @@ class AttentionMapExtractor:
         finally:
             self._is_extracting = False
 
-    def get_attention_maps(self):
+    def get_attention_maps(self) -> Dict[int, torch.Tensor]:
+        """Get extracted attention maps."""
         return self._attention_maps.copy()
-
-    def get_queries_keys_values(self):
-        return self._queries.copy(), self._keys.copy(), self._values.copy()
 
 
 class SelfAttentionMapExtraction:
-    def __init__(self, pipeline, extraction_timestep=0.5, noise_level=0.5):
+    """
+    Orchestrates self-attention extraction from video for effects mask generation.
+
+    Uses a single noising-denoising step to extract self-attention maps, which reveal
+    how different spatial regions in the video are related (e.g., objects and their
+    shadows/reflections).
+
+    Args:
+        pipeline: The diffusion pipeline (OmnimatteZero)
+        extraction_timestep: Timestep for noise injection (0.0-1.0, default: 0.5)
+        noise_level: Not used, kept for API compatibility
+    """
+
+    def __init__(self, pipeline, extraction_timestep: float = 0.5, noise_level: float = 0.5):
         self.pipeline = pipeline
         self.extraction_timestep = extraction_timestep
         self.noise_level = noise_level
         self.extractor = None
 
-    def setup_extractor(self, layer_indices=None, store_queries_keys=False):
+    def setup_extractor(self, layer_indices: Optional[List[int]] = None):
+        """Setup the attention extractor with hooks."""
         transformer = self.pipeline.transformer
         self.extractor = AttentionMapExtractor(
             model=transformer, layer_indices=layer_indices,
-            attention_type="self", store_queries_keys=store_queries_keys, average_over_heads=True)
-        self.extractor.register_hooks()
+            attention_type="self", average_over_heads=True)
+        num_layers = self.extractor.register_hooks()
+        print(f"Registered hooks on {num_layers} self-attention layers")
 
     def cleanup(self):
+        """Remove hooks and cleanup."""
         if self.extractor is not None:
             self.extractor.remove_hooks()
             self.extractor = None
 
     @torch.no_grad()
-    def extract_from_video(self, video, prompt="", height=None, width=None, generator=None):
+    def extract_from_video(self, video: torch.Tensor, prompt: str = "",
+                           height: Optional[int] = None, width: Optional[int] = None,
+                           generator: Optional[torch.Generator] = None
+                           ) -> Tuple[Dict[int, torch.Tensor], Tuple[int, int, int]]:
+        """
+        Extract self-attention maps from video.
+
+        Args:
+            video: Input video tensor (B, C, T, H, W)
+            prompt: Optional text prompt
+            height, width: Processing dimensions
+            generator: Random generator for reproducibility
+
+        Returns:
+            Tuple of (attention_maps dict, latent_dimensions tuple)
+        """
         if self.extractor is None:
             self.setup_extractor()
 
@@ -195,18 +254,28 @@ class SelfAttentionMapExtraction:
         video = video.to(device=device, dtype=dtype)
         B, C, T, H, W = video.shape
 
+        vae_temporal_compression = getattr(self.pipeline, 'vae_temporal_compression_ratio', 8)
+        valid_frames = fix_num_frames_for_vae(T, vae_temporal_compression)
+        if valid_frames != T:
+            video = video[:, :, :valid_frames, :, :]
+            T = valid_frames
+
         if height is None:
             height = H
         if width is None:
             width = W
 
+        # Encode video to latents
         latents = self._encode_video(video, generator)
 
-        noise = torch.randn_like(latents, generator=generator)
+        # Add noise using flow matching
+        noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=generator)
+        sigma = self.extraction_timestep
+        noisy_latents = (1 - sigma) * latents + sigma * noise
+
         timestep = torch.tensor([self.extraction_timestep * 1000], device=device)
 
-        noisy_latents = self.pipeline.scheduler.add_noise(latents, noise, timestep.long())
-
+        # Encode prompt
         prompt_embeds, prompt_attention_mask, _, _ = self.pipeline.encode_prompt(
             prompt=prompt, negative_prompt=None, do_classifier_free_guidance=False,
             num_videos_per_prompt=1, device=device)
@@ -215,11 +284,13 @@ class SelfAttentionMapExtraction:
         latent_height = latents.shape[3]
         latent_width = latents.shape[4]
 
+        # Prepare positional encoding
         video_coords = self.pipeline._prepare_video_ids(
-            batch_size=B, num_latent_frames=num_latent_frames,
-            latent_height=latent_height, latent_width=latent_width,
-            patch_size_t=self.pipeline.transformer_temporal_patch_size,
-            patch_size=self.pipeline.transformer_spatial_patch_size, device=device)
+            B, num_latent_frames, latent_height, latent_width,
+            self.pipeline.transformer_temporal_patch_size,
+            self.pipeline.transformer_spatial_patch_size,
+            device
+        )
         video_coords = self.pipeline._scale_video_ids(
             video_coords, scale_factor=self.pipeline.vae_spatial_compression_ratio,
             scale_factor_t=self.pipeline.vae_temporal_compression_ratio, frame_index=0, device=device)
@@ -228,6 +299,7 @@ class SelfAttentionMapExtraction:
             noisy_latents, self.pipeline.transformer_spatial_patch_size,
             self.pipeline.transformer_temporal_patch_size)
 
+        # Forward pass with attention extraction
         with self.extractor.extraction_context():
             _ = self.pipeline.transformer(
                 hidden_states=packed_latents.to(prompt_embeds.dtype),
@@ -240,25 +312,39 @@ class SelfAttentionMapExtraction:
         attention_maps = self.extractor.get_attention_maps()
         return attention_maps, (num_latent_frames, latent_height, latent_width)
 
-    def _encode_video(self, video, generator=None):
+    def _encode_video(self, video: torch.Tensor,
+                      generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        """Encode video to latent space."""
         latents = retrieve_latents(self.pipeline.vae.encode(video), generator=generator)
         latents = self.pipeline._normalize_latents(
             latents, self.pipeline.vae.latents_mean, self.pipeline.vae.latents_std)
         return latents
 
     @torch.no_grad()
-    def extract_effects_mask(self, video, object_mask, height=512, width=768,
-                             threshold=0.15, dilation_size=5, generator=None):
+    def extract_effects_mask(self, video, object_mask, height: int = 512, width: int = 768,
+                             threshold: Optional[float] = None, dilation_size: int = 3,
+                             generator: Optional[torch.Generator] = None) -> torch.Tensor:
         """
-        Extract effects (shadows, reflections) from self-attention maps
-        video: input video (path or tensor)
-        object_mask: binary mask of the object (path or tensor)
-        Returns: effects_mask tensor
+        Extract effects mask (shadows, reflections) using self-attention.
+
+        Computes per-frame spatial attention from each position to object regions,
+        identifying areas that are semantically related to the object.
+
+        Args:
+            video: Input video (path or tensor)
+            object_mask: Binary mask of the object (path or tensor)
+            height, width: Processing resolution
+            threshold: Threshold for binarizing attention map (None = adaptive)
+            dilation_size: Kernel size for morphological dilation (default: 3)
+            generator: Random generator for reproducibility
+
+        Returns:
+            Effects mask tensor (B, 1, T, H, W)
         """
         device = self.pipeline._execution_device
         dtype = self.pipeline.transformer.dtype
 
-        # load video
+        # Load video
         if isinstance(video, str):
             video = load_video(video)
         if not isinstance(video, torch.Tensor):
@@ -267,7 +353,7 @@ class SelfAttentionMapExtraction:
             video_tensor = video
         video_tensor = video_tensor.to(device=device, dtype=dtype)
 
-        # load object mask
+        # Load object mask
         if isinstance(object_mask, str):
             object_mask = load_video(object_mask)
         if not isinstance(object_mask, torch.Tensor):
@@ -276,70 +362,122 @@ class SelfAttentionMapExtraction:
             mask_tensor = object_mask
         mask_tensor = mask_tensor.to(device=device, dtype=dtype)
 
-        # binarize mask
+        # Binarize mask
         mask_binary = (mask_tensor.mean(dim=1, keepdim=True) > 0).float()
 
         B, C, T, H, W = video_tensor.shape
 
-        # extract attention maps
+        # Extract attention maps
         attention_maps, latent_dims = self.extract_from_video(video_tensor, height=H, width=W, generator=generator)
         num_latent_frames, latent_height, latent_width = latent_dims
+        spatial_size = latent_height * latent_width
 
-        # downsample mask to latent space
-        mask_latent = F.interpolate(
-            mask_binary.squeeze(2) if mask_binary.dim() == 5 else mask_binary,
-            size=(latent_height, latent_width), mode='nearest'
-        )
-        if mask_binary.dim() == 5:
-            # handle video mask - average across frames for now
-            mask_latent = F.interpolate(
-                mask_binary[:, 0, :, :, :], size=(latent_height, latent_width), mode='nearest')
+        vae_temporal_compression = getattr(self.pipeline, 'vae_temporal_compression_ratio', 8)
 
-        mask_flat = mask_latent.flatten(1)  # (B, H*W)
+        # Downsample mask to latent space for each frame
+        mask_latent_frames = []
+        for t in range(num_latent_frames):
+            pixel_t = min(t * vae_temporal_compression, T - 1)
+            mask_frame = mask_binary[:, :, pixel_t, :, :]
+            mask_latent = F.interpolate(mask_frame, size=(latent_height, latent_width), mode='nearest')
+            mask_latent_frames.append(mask_latent)
 
-        # aggregate attention from object regions
-        effects_map = torch.zeros(B, latent_height * latent_width, device=device)
+        mask_latent_all = torch.stack(mask_latent_frames, dim=2)
 
-        for layer_idx, attn_map in attention_maps.items():
-            attn_map = attn_map.to(device)
-            if attn_map.dim() == 3:
-                # (B, Q, K) - compute attention from object to other regions
-                object_attention = attn_map * mask_flat.unsqueeze(1)  # attention to object
-                effects_contribution = object_attention.sum(dim=-1)  # how much each query attends to object
-                effects_map += effects_contribution
-            elif attn_map.dim() == 4:
-                # (B, heads, Q, K)
-                attn_map = attn_map.mean(dim=1)
-                object_attention = attn_map * mask_flat.unsqueeze(1)
-                effects_contribution = object_attention.sum(dim=-1)
-                effects_map += effects_contribution
+        # Compute per-frame spatial attention to object
+        per_frame_effects = []
 
-        # normalize
-        effects_map = effects_map / (len(attention_maps) + 1e-8)
-        effects_map = effects_map.view(B, 1, latent_height, latent_width)
+        for frame_t in range(num_latent_frames):
+            frame_effects_sum = torch.zeros(B, spatial_size, device=device, dtype=dtype)
 
-        # upsample back to original resolution
-        effects_mask = F.interpolate(effects_map, size=(H, W), mode='bilinear', align_corners=False)
+            for layer_idx, attn_map in attention_maps.items():
+                attn_map = attn_map.to(device)
+                if attn_map.dim() == 4:
+                    attn_map = attn_map.mean(dim=1)
 
-        # threshold and binarize
-        effects_mask = (effects_mask > threshold).float()
+                seq_len = attn_map.shape[-1]
+                expected_seq_len = num_latent_frames * spatial_size
 
-        # dilate to cover more area
+                if seq_len != expected_seq_len:
+                    continue
+
+                # Reshape to (B, num_frames, H*W, num_frames, H*W)
+                attn_reshaped = attn_map.view(B, num_latent_frames, spatial_size, num_latent_frames, spatial_size)
+
+                # Extract attention FROM frame_t TO all frames
+                attn_from_frame_t = attn_reshaped[:, frame_t, :, :, :]
+
+                # Sum attention to object regions across all frames
+                frame_attention_to_obj = torch.zeros(B, spatial_size, device=device, dtype=dtype)
+                for src_t in range(num_latent_frames):
+                    src_mask = mask_latent_all[:, 0, src_t, :, :].view(B, -1)
+                    attn_to_obj = (attn_from_frame_t[:, :, src_t, :] * src_mask.unsqueeze(1)).sum(dim=-1)
+                    frame_attention_to_obj += attn_to_obj
+
+                frame_effects_sum += frame_attention_to_obj
+
+            # Normalize by number of layers
+            frame_effects = frame_effects_sum / (len(attention_maps) + 1e-8)
+            frame_effects = frame_effects.view(B, latent_height, latent_width)
+            per_frame_effects.append(frame_effects)
+
+        # Stack per-frame effects
+        effects_latent = torch.stack(per_frame_effects, dim=1)
+
+        # Upsample spatially
+        effects_spatial = F.interpolate(
+            effects_latent.view(B * num_latent_frames, 1, latent_height, latent_width),
+            size=(H, W), mode='bilinear', align_corners=False
+        ).view(B, num_latent_frames, H, W)
+
+        # Interpolate temporally
+        effects_temporal = F.interpolate(
+            effects_spatial.unsqueeze(1),
+            size=(T, H, W), mode='trilinear', align_corners=False
+        ).squeeze(1)
+
+        effects_mask = effects_temporal.unsqueeze(1)
+
+        # Adaptive thresholding if not specified
+        if threshold is None:
+            flat_effects = effects_mask.view(-1)
+            threshold = flat_effects.mean() + 0.5 * flat_effects.std()
+            print(f"Using adaptive threshold: {threshold:.4f}")
+
+        effects_mask_binary = (effects_mask > threshold).float()
+
+        # Apply dilation to smooth edges
         if dilation_size > 0:
             kernel = torch.ones(1, 1, dilation_size, dilation_size, device=device)
-            effects_mask = F.conv2d(effects_mask, kernel, padding=dilation_size // 2)
-            effects_mask = (effects_mask > 0).float()
+            dilated_frames = []
+            for t in range(T):
+                frame = effects_mask_binary[:, :, t, :, :]
+                frame_dilated = F.conv2d(frame, kernel, padding=dilation_size // 2)
+                frame_dilated = (frame_dilated > 0).float()
+                dilated_frames.append(frame_dilated)
+            effects_mask_binary = torch.stack(dilated_frames, dim=2)
 
-        # expand to video frames
-        effects_mask = effects_mask.unsqueeze(2).expand(-1, -1, T, -1, -1)
-
-        return effects_mask
+        return effects_mask_binary
 
     @torch.no_grad()
-    def generate_total_mask(self, video_path, object_mask_path, output_path,
-                            height=512, width=768, threshold=0.15, dilation_size=15, fps=24):
+    def generate_total_mask(self, video_path: str, object_mask_path: str, output_path: str,
+                            height: int = 512, width: int = 768,
+                            threshold: Optional[float] = None, dilation_size: int = 3,
+                            fps: int = 24) -> torch.Tensor:
         """
-        Generate total_mask.mp4 combining object_mask with attention-based effects
+        Generate total_mask.mp4 combining object_mask with attention-based effects.
+
+        Args:
+            video_path: Path to input video
+            object_mask_path: Path to object mask video
+            output_path: Path to save total mask video
+            height, width: Processing resolution
+            threshold: Threshold for effects mask (None = adaptive)
+            dilation_size: Dilation kernel size for smoothing
+            fps: Output video frame rate
+
+        Returns:
+            Total mask tensor (B, 1, T, H, W)
         """
         device = self.pipeline._execution_device
         dtype = self.pipeline.transformer.dtype
@@ -355,9 +493,19 @@ class SelfAttentionMapExtraction:
         mask_tensor = self.pipeline.video_processor.preprocess_video(object_mask, height, width)
         mask_tensor = mask_tensor.to(device=device, dtype=dtype)
 
-        B, C, T, H, W = video_tensor.shape
+        B, C, T_orig, H, W = video_tensor.shape
 
-        # binarize object mask
+        # Fix frame count for VAE compatibility
+        vae_temporal_compression = getattr(self.pipeline, 'vae_temporal_compression_ratio', 8)
+        valid_frames = fix_num_frames_for_vae(T_orig, vae_temporal_compression)
+        if valid_frames != T_orig:
+            print(f"Adjusting frames from {T_orig} to {valid_frames} for VAE compatibility")
+            video_tensor = video_tensor[:, :, :valid_frames, :, :]
+            mask_tensor = mask_tensor[:, :, :valid_frames, :, :]
+
+        T = video_tensor.shape[2]
+
+        # Binarize object mask
         object_mask_binary = (mask_tensor.mean(dim=1, keepdim=True) > 0).float()
 
         print("Extracting self-attention maps...")
@@ -365,14 +513,19 @@ class SelfAttentionMapExtraction:
             video_tensor, object_mask_binary, height=H, width=W,
             threshold=threshold, dilation_size=dilation_size)
 
-        # combine object mask + effects mask
+        # Combine object mask + effects mask
         total_mask = torch.clamp(object_mask_binary + effects_mask, 0, 1)
 
-        # convert to video frames
-        total_mask_rgb = total_mask.expand(-1, 3, -1, -1, -1)  # (B, 3, T, H, W)
+        # Report mask statistics
+        obj_pixels = object_mask_binary.sum().item()
+        total_pixels = total_mask.sum().item()
+        ratio = total_pixels / obj_pixels if obj_pixels > 0 else 0
+        print(f"Mask coverage: object={obj_pixels:.0f}, total={total_pixels:.0f}, ratio={ratio:.2f}x")
+
+        # Convert to video frames
+        total_mask_rgb = total_mask.expand(-1, 3, -1, -1, -1)
         total_mask_rgb = (total_mask_rgb * 255).byte()
 
-        # to PIL images
         frames = []
         for t in range(T):
             frame = total_mask_rgb[0, :, t].permute(1, 2, 0).cpu().numpy()
@@ -384,10 +537,22 @@ class SelfAttentionMapExtraction:
         return total_mask
 
 
-def generate_total_mask_for_folder(pipeline, folder_path, output_folder=None,
-                                   height=512, width=768, threshold=0.15, dilation_size=15):
+def generate_total_mask_for_folder(pipeline, folder_path: str, output_folder: Optional[str] = None,
+                                   height: int = 512, width: int = 768,
+                                   threshold: Optional[float] = None, dilation_size: int = 3):
     """
-    Process a folder containing video.mp4 and object_mask.mp4, generate total_mask.mp4
+    Process a folder containing video.mp4 and object_mask.mp4, generate total_mask.mp4.
+
+    Args:
+        pipeline: The diffusion pipeline (OmnimatteZero)
+        folder_path: Path to folder with video.mp4 and object_mask.mp4
+        output_folder: Output folder (default: same as input)
+        height, width: Processing resolution
+        threshold: Threshold for effects mask (None = adaptive)
+        dilation_size: Dilation kernel size for smoothing
+
+    Returns:
+        Total mask tensor or None if files not found
     """
     if output_folder is None:
         output_folder = folder_path
@@ -416,63 +581,23 @@ def generate_total_mask_for_folder(pipeline, folder_path, output_folder=None,
         extractor.cleanup()
 
 
-def visualize_attention_maps(attention_maps, save_path=None, num_cols=4, figsize=(16, 12)):
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib not installed")
-        return
-
-    num_layers = len(attention_maps)
-    if num_layers == 0:
-        print("No attention maps to visualize")
-        return
-
-    num_rows = (num_layers + num_cols - 1) // num_cols
-
-    fig, axes = plt.subplots(num_rows, num_cols, figsize=figsize)
-    if num_rows == 1:
-        axes = axes.reshape(1, -1)
-
-    for idx, (layer_idx, attn_map) in enumerate(sorted(attention_maps.items())):
-        row = idx // num_cols
-        col = idx % num_cols
-        ax = axes[row, col]
-
-        if attn_map.dim() == 4:
-            attn_map = attn_map[0].mean(0)
-        elif attn_map.dim() == 3:
-            attn_map = attn_map[0]
-
-        im = ax.imshow(attn_map.numpy(), cmap='viridis', aspect='auto')
-        ax.set_title(f'Layer {layer_idx}')
-        ax.axis('off')
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    for idx in range(num_layers, num_rows * num_cols):
-        row = idx // num_cols
-        col = idx % num_cols
-        axes[row, col].axis('off')
-
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-    else:
-        plt.show()
-
-
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--video_folder", type=str, required=True, help="folder with video.mp4 and object_mask.mp4")
-    parser.add_argument("--height", type=int, default=512)
-    parser.add_argument("--width", type=int, default=768)
-    parser.add_argument("--threshold", type=float, default=0.15)
-    parser.add_argument("--dilation", type=int, default=15)
-    parser.add_argument("--cache_dir", type=str)
+    parser = argparse.ArgumentParser(
+        description="Generate total_mask.mp4 from video and object_mask using self-attention")
+    parser.add_argument("--video_folder", type=str, required=True,
+                        help="Folder containing video.mp4 and object_mask.mp4")
+    parser.add_argument("--height", type=int, default=512,
+                        help="Processing height (default: 512)")
+    parser.add_argument("--width", type=int, default=768,
+                        help="Processing width (default: 768)")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Threshold for effects mask (default: adaptive)")
+    parser.add_argument("--dilation", type=int, default=3,
+                        help="Dilation size for smoothing edges (default: 3)")
+    parser.add_argument("--cache_dir", type=str, default="",
+                        help="HuggingFace cache directory")
     args = parser.parse_args()
 
     from OmnimatteZero import OmnimatteZero
