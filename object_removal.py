@@ -16,10 +16,7 @@ def round_to_nearest_resolution_acceptable_by_vae(height, width):
 
 pipe = OmnimatteZero.from_pretrained("a-r-r-o-w/LTX-Video-0.9.7-diffusers", torch_dtype=torch.bfloat16,
                                      cache_dir="/inputs/huggingface_cache")
-pipe_upsample = LTXLatentUpsamplePipeline.from_pretrained(
-    "a-r-r-o-w/LTX-Video-0.9.7-Latent-Spatial-Upsampler-diffusers", vae=pipe.vae, torch_dtype=torch.bfloat16)
 pipe.to("cuda")
-pipe_upsample.to("cuda")
 pipe.vae.enable_tiling()
 
 base_dir = "example_videos"
