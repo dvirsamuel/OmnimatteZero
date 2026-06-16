@@ -165,15 +165,13 @@ Typical mask expansion ratios are 1.5x-2.0x depending on the scene's effects.
 
 #### 💡 Refine with SAM2
 
-For even better results, you can use the attention-based mask as a prompt for [SAM2](https://github.com/facebookresearch/segment-anything-2):
-This two-stage approach combines the semantic understanding of the diffusion model's attention (which knows *what* regions are related to the object) with SAM2's precise boundary detection (which knows *exactly where* those regions are).
+For even better results, refine the attention-based mask with [SAM2](https://github.com/facebookresearch/segment-anything-2). This two-stage approach combines the semantic understanding of the diffusion model's attention (which knows *what* regions are related to the object) with SAM2's precise boundary detection (which knows *exactly where* those regions are):
 
+```bash
+python refine_with_sam2.py --video_folder ./example_videos/cat_reflection
+```
 
-### Important Note on Attention Guidance
-
-> **⚠️ Note (Updated 1/26):** While our paper describes Temporal Attention Guidance and Spatial Attention Guidance using TAP-Net for improved temporal consistency, these features were originally developed for LTX-Video-0.9.1. We recently encountered a bug while fetching the LTX-0.9.1 model (as of 1/26) which we did not encounter during paper submission (5/25). We are working to fix this issue.
->
-> **In the meantime, we have upgraded to LTX-Video-0.9.7**, which we found achieves good object removal results **without** the explicit temporal and spatial attention guidance. The current code runs without attention guidance, but the implementation can be found in `attention_guidance.py` for reference.
+The script seeds SAM2's video predictor with points sampled from the object mask and the attention effect region, propagates the segmentation across the clip, and writes a crisp, temporally consistent `total_mask.mp4`. It requires `transformers>=4.54` (the SAM2 weights are downloaded automatically on first use).
 
 ---
 
